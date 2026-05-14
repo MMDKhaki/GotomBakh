@@ -1,0 +1,53 @@
+name: Code & Workflow Validation Bot
+
+on:
+  push:
+    branches: [ main ]        # or your default branch
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:          # also allow manual trigger
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install qrcode[pil] requests pyflakes
+
+      - name: Check Python syntax (lint with pyflakes)
+        run: pyflakes main.py || true   # will show warnings, not fail
+
+      - name: Dry-run main.py (no network calls)
+        run: |
+          # Run a quick syntax-only check by importing, not executing full script
+          python -c "import ast; ast.parse(open('main.py').read()); print('main.py syntax OK')"
+
+      - name: Validate GitHub Actions workflows (YAML)
+        uses: actions/yamllint@v1
+        with:
+          args: '.github/workflows/'
+
+  # Optional: Check if dependencies can be installed from scratch
+  test-install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test pip install
+        run: |
+          python -m venv testenv
+          source testenv/bin/activate
+          pip install qrcode[pil] requests
+          python -c "import qrcode; print('Dependencies OK')"
