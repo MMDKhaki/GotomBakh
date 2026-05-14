@@ -1,28 +1,31 @@
 #!/usr/bin/env python3
 """
-VLESS config generator for GitHub Actions runner.
-1. Download and extract xray-core.
-2. Detect the runner's public IPv4.
-3. Generate a VLESS server inbound config.
-4. Create a VLESS share link (with 6-hour expiry).
-5. Generate a QR code for the link.
-6. Write config, link, and QR code as job artifacts.
+Download Xray-core, detect runner IP, generate a VLESS inbound config
+with a 6‑hour valid user, and build a QR code.
+The server uses fakedns to resolve every non‑Iranian domain to apat.com’s IP.
 """
 
-import json, os, random, re, string, subprocess, sys, time
+import json
+import os
+import socket
+import sys
 import urllib.request
 import uuid
-import qrcode
+import zipfile
 from datetime import datetime, timedelta, timezone
 
-XRAY_VERSION = "v24.12.19"          # Use a recent stable release
+import qrcode
+
+# ----------------------------------------------------------------------
+# Configuration
+XRAY_VERSION = "v24.12.19"
 XRAY_URL = f"https://github.com/XTLS/Xray-core/releases/download/{XRAY_VERSION}/Xray-linux-64.zip"
 XRAY_DIR = "/tmp/xray"
-CONFIG_FILE = os.path.join(XRAY_DIR, "config.json")
+SERVER_CONFIG = os.path.join(XRAY_DIR, "config.json")
 LINK_FILE = "vless_link.txt"
 QR_FILE = "vless_qr.png"
 
-# --- Top 25 Iranian sites (domains) -------------------------------------------------
+# Top 25 Iranian sites (used to bypass the firewall for domestic traffic)
 IRANIAN_SITES = [
     "aparat.com", "digikala.com", "filimo.com", "namasha.com", "varzesh3.com",
     "khabaronline.ir", "tabnak.ir", "yjc.ir", "farsnews.ir", "mehrnews.com",
@@ -31,46 +34,44 @@ IRANIAN_SITES = [
     "snapp.ir", "cafebazaar.ir", "iranserver.com", "blog.ir", "mizanonline.ir",
 ]
 
-# --- Helper functions --------------------------------------------------------------
-def run(cmd, **kwargs):
-    """Run a shell command and return output."""
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, **kwargs)
-    if result.returncode != 0:
-        print(f"Command failed: {cmd}\n{result.stderr}")
-        sys.exit(result.returncode)
-    return result.stdout.strip()
-
-def generate_uuid():
-    """Generate a random UUID for VLESS user."""
-    return str(uuid.uuid4())
-
-def public_ip():
-    """Retrieve the public IP using ipify."""
-    try:
-        ip = urllib.request.urlopen("https://api.ipify.org", timeout=5).read().decode().strip()
-        return ip
-    except Exception:
-        # fallback to alternative
-        ip = urllib.request.urlopen("https://api64.ipify.org", timeout=5).read().decode().strip()
-        return ip
-
-# --- Download xray-core ------------------------------------------------------------
+# ----------------------------------------------------------------------
 def download_xray():
-    """Download and extract xray-core binary."""
-    print(">>> Downloading xray-core...")
+    """Download and extract Xray-core using only Python stdlib."""
+    print(">>> Downloading xray-core ...")
     os.makedirs(XRAY_DIR, exist_ok=True)
-    run(f"curl -L -o /tmp/xray.zip {XRAY_URL}")
-    run(f"unzip -o /tmp/xray.zip -d {XRAY_DIR}")
-    run(f"chmod +x {XRAY_DIR}/xray")
+    zip_path = "/tmp/xray.zip"
+    urllib.request.urlretrieve(XRAY_URL, zip_path)
+    with zipfile.ZipFile(zip_path, "r") as z:
+        z.extractall(XRAY_DIR)
+    # Make the binary executable
+    os.chmod(os.path.join(XRAY_DIR, "xray"), 0o755)
     print(">>> xray-core ready.")
 
-# --- Generate server inbound config ------------------------------------------------
-def create_inbound_config(ip: str, port: int, user_uuid: str):
-    """Create a minimal Xray config with a VLESS inbound."""
-    # Use an Iranian sites list for outbound routing
-    # (You can also use geosite:ir if you provide a geoip file.)
-    # Here we build outbound routing that sends everything to
-    # the internet directly, but you may replace it with a custom rule.
+def public_ipv4():
+    """Return the runner's public IPv4 address."""
+    for url in ("https://api.ipify.org", "https://api64.ipify.org"):
+        try:
+            with urllib.request.urlopen(url, timeout=5) as r:
+                return r.read().decode().strip()
+        except Exception:
+            continue
+    raise RuntimeError("Failed to obtain public IP")
+
+def get_aparat_ip():
+    """Resolve aparat.com to an IPv4 address."""
+    return socket.gethostbyname("aparat.com")
+
+def generate_user():
+    return str(uuid.uuid4())
+
+def create_server_config(ip: str, port: int, user_id: str, aparat_ip: str):
+    """
+    Write a full Xray server config with a VLESS inbound and a DNS section
+    that redirects all non‑Iranian domains to aparat.com.
+    """
+    # Build the list of "domain:" rules for the Iranian sites
+    ir_domain_rules = [f"domain:{site}" for site in IRANIAN_SITES]
+
     config = {
         "log": {"loglevel": "warning"},
         "inbounds": [
@@ -80,7 +81,7 @@ def create_inbound_config(ip: str, port: int, user_uuid: str):
                 "settings": {
                     "clients": [
                         {
-                            "id": user_uuid,
+                            "id": user_id,
                             "level": 0,
                             "email": "user@vless.auto",
                         }
@@ -95,23 +96,19 @@ def create_inbound_config(ip: str, port: int, user_uuid: str):
             }
         ],
         "outbounds": [
-            {
-                "tag": "direct",
-                "protocol": "freedom",
-            },
-            {
-                "tag": "block",
-                "protocol": "blackhole",
-            },
+            {"tag": "direct", "protocol": "freedom"},
+            {"tag": "block", "protocol": "blackhole"},
         ],
         "routing": {
             "domainStrategy": "AsIs",
             "rules": [
+                # Allow Iranian sites directly
                 {
                     "type": "field",
-                    "domain": [f"domain:{site}" for site in IRANIAN_SITES],
+                    "domain": ir_domain_rules,
                     "outboundTag": "direct",
                 },
+                # Ensure inbound VLESS traffic can leave
                 {
                     "type": "field",
                     "protocol": ["vless"],
@@ -119,68 +116,67 @@ def create_inbound_config(ip: str, port: int, user_uuid: str):
                 },
             ],
         },
+        "dns": {
+            "servers": [
+                {
+                    "address": "8.8.8.8",          # Normal DNS for Iranian sites
+                    "domains": ir_domain_rules,
+                },
+                {
+                    "address": "fakedns",          # Everything else → aparat.com
+                },
+            ],
+            "fakedns": {
+                "ipPool": [f"{aparat_ip}/32"],
+                "poolSize": 1,
+            },
+        },
     }
-    with open(CONFIG_FILE, "w") as f:
+
+    with open(SERVER_CONFIG, "w") as f:
         json.dump(config, f, indent=2)
-    print(f">>> Server config written to {CONFIG_FILE}")
+    print(f">>> Server config written to {SERVER_CONFIG}")
 
-# --- Generate VLESS share link ----------------------------------------------------
-def generate_vless_link(ip: str, port: int, user_uuid: str, expiry_hours: int = 6):
-    """Create a vless:// share link with a comment indicating expiry."""
-    expiry_time = datetime.now(timezone.utc) + timedelta(hours=expiry_hours)
-    expiry_str = expiry_time.strftime("%Y-%m-%dT%H:%M:%SZ")
-    # Simple fragment with expiry info
-    fragment = f"VLESS-{expiry_hours}H-Valid"
-    link = f"vless://{user_uuid}@{ip}:{port}?security=none&type=tcp#{fragment}"
-    return link
+def generate_vless_link(ip: str, port: int, user_id: str, valid_hours: int = 6):
+    """Return a vless:// share link with an expiry timestamp in the fragment."""
+    expiry = (datetime.now(timezone.utc) + timedelta(hours=valid_hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    fragment = f"IR-VPN-{valid_hours}H-valid"
+    return f"vless://{user_id}@{ip}:{port}?security=none&type=tcp#{fragment}"
 
-def generate_qr(link: str):
-    """Generate a QR code image for the link."""
+def generate_qr(link: str, filepath: str):
     img = qrcode.make(link)
-    img.save(QR_FILE)
-    print(f">>> QR code saved to {QR_FILE}")
+    img.save(filepath)
+    print(f">>> QR code saved to {filepath}")
 
-# --- Main execution ---------------------------------------------------------------
+# ----------------------------------------------------------------------
 def main():
-    print("=== VLESS Config Generator ===")
+    print("=== VLESS Config Generator (with aparat.com redirect) ===")
 
-    # 1. Download xray-core
+    # 1. Prepare Xray
     download_xray()
 
-    # 2. Get public IP of the runner
-    try:
-        ip = public_ip()
-        print(f">>> Runner public IP: {ip}")
-    except Exception as e:
-        print("Failed to get public IP:", e)
-        sys.exit(1)
+    # 2. Gather runtime info
+    server_ip = public_ipv4()
+    print(f">>> Runner public IP: {server_ip}")
+    aparat_ip = get_aparat_ip()
+    print(f">>> aparat.com resolved to: {aparat_ip}")
 
-    # 3. Choose a port (avoid privileged ports)
-    port = 443  # Commonly used, but you can randomize
-    # 4. Generate user UUID
-    user_uuid = generate_uuid()
+    # 3. User and port
+    user_uuid = generate_user()
+    vless_port = 443      # typical VLESS port
 
-    # 5. Create server inbound config
-    create_inbound_config(ip, port, user_uuid)
+    # 4. Server config (with DNS redirection)
+    create_server_config(server_ip, vless_port, user_uuid, aparat_ip)
 
-    # 6. Generate VLESS link (valid for 6 hours)
-    vless_link = generate_vless_link(ip, port, user_uuid, expiry_hours=6)
+    # 5. VLESS link & QR
+    link = generate_vless_link(server_ip, vless_port, user_uuid, valid_hours=6)
     with open(LINK_FILE, "w") as f:
-        f.write(vless_link)
-    print(f">>> VLESS link: {vless_link}")
+        f.write(link)
+    print(f">>> VLESS link: {link}")
+    generate_qr(link, QR_FILE)
 
-    # 7. Generate QR code
-    generate_qr(vless_link)
-
-    # 8. (Optional) Start xray to test connectivity, but in a GitHub job it's ephemeral
-    # You can uncomment the next lines if you want to start xray for the workflow duration.
-    # run(f"cd {XRAY_DIR} && ./xray run -config config.json &")
-    # time.sleep(5)  # give it a moment
-
-    print("=== Done ===")
-    print(f"Config file: {CONFIG_FILE}")
-    print(f"VLESS link file: {LINK_FILE}")
-    print(f"QR code file: {QR_FILE}")
+    print("\n=== Done ===")
+    print("Artifacts: server config.json, vless_link.txt, vless_qr.png")
 
 if __name__ == "__main__":
     main()
